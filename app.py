@@ -17,7 +17,7 @@ else:
     st.error("Missing GEMINI_API_KEY in Streamlit Secrets. Please add it to your Streamlit Cloud configuration.")
     st.stop()
 
-# 3. Complete System Instructions for Detailed Evaluation & Coordinates
+# 3. System Instructions focused on Question Identifier extraction
 SYSTEM_INSTRUCTIONS = """
 You are a precise Academic Data Formatting Agent. 
 
@@ -38,31 +38,33 @@ SECTION 2: EXCEL SPREADSHEET MATRIX
 Provide a clean Markdown table containing your granular evaluations. Format your table with these exact columns:
 | Question # | Max Marks | Marks Awarded | Deductions | Deduction Reason / Feedback Summary |
 
-SECTION 3: JSON COORDINATES FOR PDF OVERLAY
-AT THE VERY END OF YOUR RESPONSE, provide a raw JSON array containing page-by-page overlay marks for the PDF writer.
+SECTION 3: JSON STRUCTURE FOR PDF STAMPING
+AT THE VERY END OF YOUR RESPONSE, provide a raw JSON array. For each evaluated item, provide:
+- 'page': page index (1-based)
+- 'target_text': exact question heading text as it appears on the student paper (e.g. "Q1", "Question 1", "Q.2") to help locate it programmatically.
+- 'score_text': score summary text to stamp (e.g. "Q1: 4/5")
 
 Example JSON structure required at the very end:
 [
   {
     "page": 1,
-    "score_text": "Q1: 4/5 (Missing arrows)",
-    "x": 50,
-    "y": 100
+    "target_text": "Q1",
+    "score_text": "Q1: 4/5 (Missing arrows)"
   },
   {
     "page": 1,
-    "score_text": "Q2: 5/5",
-    "x": 50,
-    "y": 300
+    "target_text": "Q2",
+    "score_text": "Q2: 5/5"
   }
 ]
-
-Note: Coordinates (x, y) represent point locations on a standard PDF page (top-left is 0,0). Place score text neatly in open margins near each respective question.
 """
 
-# 4. Helper Function to Draw Red Annotations onto Student PDF Pages
+# 4. Helper Function: Automatic Bounding-Box Detection & Stamping
 def burn_annotations_to_pdf(pdf_bytes, json_data):
-    """Draws red score annotations directly onto the student's PDF pages."""
+    """
+    Locates question headings programmatically on PDF pages and places score stamps 
+    immediately below the detected text bounding box in the right margin.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
     try:
@@ -71,23 +73,39 @@ def burn_annotations_to_pdf(pdf_bytes, json_data):
             page_num = item.get("page", 1) - 1  # 0-indexed page index
             if 0 <= page_num < len(doc):
                 page = doc[page_num]
-                text = item.get("score_text", "")
-                x = item.get("x", 50)
-                y = item.get("y", 100)
+                target_text = item.get("target_text", "")
+                score_text = item.get("score_text", "")
                 
-                # Draw red text directly on the PDF using built-in font
+                page_width = page.rect.width
+                page_height = page.rect.height
+                
+                # Default right margin position
+                x = max(page_width - 170.0, 50.0)
+                y = 100.0  # Fallback vertical position
+                
+                # Programmatically search for the exact location of the question header on the page
+                if target_text:
+                    text_instances = page.search_for(target_text)
+                    if text_instances:
+                        # Pick the first match on the page and place stamp directly below its bottom edge (+ 4px gap)
+                        first_match = text_instances[0]
+                        y = first_match.y1 + 4.0
+                
+                # Clamp Y so it stays visible on the page
+                y = min(max(y, 25.0), page_height - 25.0)
+                
+                # Draw red score text directly below the target text
                 try:
                     page.insert_text(
                         fitz.Point(x, y),
-                        text,
-                        fontsize=14,
-                        color=(0.8, 0, 0),  # Red color (RGB)
+                        score_text,
+                        fontsize=12,
+                        color=(0.85, 0, 0),  # Red
                         fontname="helv"
                     )
                 except Exception:
-                    # Fallback method: draw as a free text annotation box
-                    rect = fitz.Rect(x, y, x + 250, y + 30)
-                    annot = page.add_freetext_annot(rect, text, fontsize=12, text_color=(0.8, 0, 0))
+                    rect = fitz.Rect(x, y, x + 150, y + 25)
+                    annot = page.add_freetext_annot(rect, score_text, fontsize=11, text_color=(0.85, 0, 0))
                     annot.update()
     except Exception as e:
         st.warning(f"Could not parse automatic PDF overlay: {e}")
@@ -119,7 +137,6 @@ if st.button("🚀 Run Assessment Marking"):
                     "Grade the student script against the marking scheme according to system instructions."
                 ]
                 
-                # List of active models to try sequentially
                 models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
                 response = None
                 
@@ -134,17 +151,15 @@ if st.button("🚀 Run Assessment Marking"):
                         )
                         if response:
                             break
-                    except Exception as e:
+                    except Exception:
                         continue
 
                 if response:
                     st.success("Marking Complete!")
                     st.markdown("---")
                     
-                    # Display full response (Annotation List, Excel Matrix Table, and Feedback)
                     st.markdown(response.text)
                     
-                    # Extract JSON block and generate downloadable annotated PDF file
                     json_match = re.search(r"\[\s*\{.*\}\s*\]", response.text, re.DOTALL)
                     if json_match and student_file.type == "application/pdf":
                         json_str = json_match.group(0)
