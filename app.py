@@ -17,7 +17,7 @@ else:
     st.error("Missing GEMINI_API_KEY in Streamlit Secrets. Please add it to your Streamlit Cloud configuration.")
     st.stop()
 
-# 3. Enhanced System Instructions with Strict Sub-Question Rules
+# 3. System Instructions with Dual Coordinate & Text Anchors
 SYSTEM_INSTRUCTIONS = """
 You are a precise Academic Data Formatting Agent. 
 
@@ -41,7 +41,8 @@ Provide a clean Markdown table containing your granular evaluations. Format your
 SECTION 3: JSON STRUCTURE FOR PDF STAMPING
 AT THE VERY END OF YOUR RESPONSE, provide a raw JSON array. For each evaluated item (including all sub-parts), provide:
 - 'page': page index (1-based)
-- 'target_text': exact full label string as printed on the student paper for matching (e.g. "4(b)i", "4(b)ii", "(ii)", "Q4b"). NEVER use isolated numbers like "ii" without context.
+- 'target_text': exact question heading label as written (e.g. "4(b)i", "4(b)ii", "ii)")
+- 'y': estimated vertical position (0 to 800 scale, where 0 is top margin and 800 is bottom margin) corresponding EXACTLY to where that specific sub-question answer is written.
 - 'score_text': score summary text to stamp (e.g. "4(b)ii: 2/2")
 
 Example JSON structure required at the very end:
@@ -49,29 +50,29 @@ Example JSON structure required at the very end:
   {
     "page": 1,
     "target_text": "4(b)i",
+    "y": 140,
     "score_text": "4(b)i: 1/1"
   },
   {
     "page": 1,
     "target_text": "4(b)ii",
+    "y": 280,
     "score_text": "4(b)ii: 2/2"
   }
 ]
 """
 
-# 4. Helper Function: Disambiguated Search + Collision Avoidance
+# 4. Helper Function: Hybrid Anchor (Text Search + Vision Y Fallback)
 def burn_annotations_to_pdf(pdf_bytes, json_data):
     """
-    Locates question/sub-question headings programmatically on PDF pages,
-    places score stamps in the right margin, and prevents overlaps.
+    Stamps sub-question scores next to their individual handwritten answers using 
+    PyMuPDF text-matching first, falling back to Gemini's vision-estimated Y position.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
     try:
         annotations = json.loads(json_data)
-        
-        # Track used vertical slots per page to prevent overlap collisions
-        used_y_coords = {}
+        used_positions = {}  # Tracks placed coordinates to prevent identical overlaps
         
         for item in annotations:
             page_num = item.get("page", 1) - 1  # 0-indexed page index
@@ -79,6 +80,7 @@ def burn_annotations_to_pdf(pdf_bytes, json_data):
                 page = doc[page_num]
                 target_text = str(item.get("target_text", "")).strip()
                 score_text = str(item.get("score_text", "")).strip()
+                raw_y = float(item.get("y", 100))
                 
                 page_width = page.rect.width
                 page_height = page.rect.height
@@ -87,38 +89,34 @@ def burn_annotations_to_pdf(pdf_bytes, json_data):
                 x = max(page_width - 170.0, 50.0)
                 found_y = None
                 
-                # Multi-stage Search Strategy for Sub-questions
+                # 1. Try PyMuPDF exact text lookup on page
                 if target_text:
-                    # 1. Exact Search
                     matches = page.search_for(target_text)
-                    
-                    # 2. Sub-part fallback: search for "(ii)" if "4(b)ii" wasn't found as a single block
-                    if not matches and "(" in target_text and ")" in target_text:
+                    if not matches and "(" in target_text:
                         sub_part = target_text[target_text.find("("):]
                         matches = page.search_for(sub_part)
-                        
+                    
                     if matches:
-                        # Grab top-most match for this sub-question header
                         found_y = matches[0].y1 + 2.0
 
-                # Fallback location if PyMuPDF couldn't locate target_text
+                # 2. Fallback to Gemini's Vision Y estimate for that specific answer block
                 if found_y is None:
-                    found_y = 100.0
+                    found_y = raw_y
                 
-                # ANTI-COLLISION CHECK: If another stamp is already within 18px of this location, shift downward
-                if page_num not in used_y_coords:
-                    used_y_coords[page_num] = []
+                # 3. Micro-nudge: prevent exact 1-to-1 pixel collision if two marks land on identical coordinates
+                if page_num not in used_positions:
+                    used_positions[page_num] = []
                 
-                for existing_y in used_y_coords[page_num]:
-                    if abs(existing_y - found_y) < 18.0:
-                        found_y = existing_y + 18.0  # Push down by line-height step
+                for existing_y in used_positions[page_num]:
+                    if abs(existing_y - found_y) < 10.0:
+                        found_y += 14.0  # Slight offset to keep them legible
+                        
+                used_positions[page_num].append(found_y)
                 
-                used_y_coords[page_num].append(found_y)
-                
-                # Clamp Y inside printable limits
+                # Clamp Y inside visible boundary
                 y = min(max(found_y, 25.0), page_height - 25.0)
                 
-                # Render red score text
+                # Render red score annotation
                 try:
                     page.insert_text(
                         fitz.Point(x, y),
