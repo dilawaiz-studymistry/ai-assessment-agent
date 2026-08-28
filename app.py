@@ -17,7 +17,7 @@ else:
     st.error("Missing GEMINI_API_KEY in Streamlit Secrets. Please add it to your Streamlit Cloud configuration.")
     st.stop()
 
-# 3. System Instructions focused on Question Identifier extraction
+# 3. Enhanced System Instructions with Strict Sub-Question Rules
 SYSTEM_INSTRUCTIONS = """
 You are a precise Academic Data Formatting Agent. 
 
@@ -25,8 +25,8 @@ You will analyze two documents uploaded by the user: a handwritten or typed Stud
 
 CRITICAL OPERATIONAL RULES:
 - Do NOT rewrite or replicate any drawings, images, math equations, or text from the student's script. 
-- Track student responses solely by their structural identifier (e.g., Q1, Q2, Q3a).
-- Read diagrams (such as reaction mechanisms) dynamically. Evaluate if mandatory features (arrows, intermediates, valencies, labels) match the marking scheme, decide the grade, but communicate this strictly as a numerical deduction and a structural textual comment.
+- Track student responses solely by their structural identifier (e.g., Q1, Q2, Q4(b)i, Q4(b)ii).
+- Read diagrams (such as reaction mechanisms) dynamically. Evaluate if mandatory features match the scheme, decide the grade, and communicate this strictly as a numerical deduction and structural feedback.
 
 OUTPUT REQUIREMENTS:
 
@@ -39,74 +39,99 @@ Provide a clean Markdown table containing your granular evaluations. Format your
 | Question # | Max Marks | Marks Awarded | Deductions | Deduction Reason / Feedback Summary |
 
 SECTION 3: JSON STRUCTURE FOR PDF STAMPING
-AT THE VERY END OF YOUR RESPONSE, provide a raw JSON array. For each evaluated item, provide:
+AT THE VERY END OF YOUR RESPONSE, provide a raw JSON array. For each evaluated item (including all sub-parts), provide:
 - 'page': page index (1-based)
-- 'target_text': exact question heading text as it appears on the student paper (e.g. "Q1", "Question 1", "Q.2") to help locate it programmatically.
-- 'score_text': score summary text to stamp (e.g. "Q1: 4/5")
+- 'target_text': exact full label string as printed on the student paper for matching (e.g. "4(b)i", "4(b)ii", "(ii)", "Q4b"). NEVER use isolated numbers like "ii" without context.
+- 'score_text': score summary text to stamp (e.g. "4(b)ii: 2/2")
 
 Example JSON structure required at the very end:
 [
   {
     "page": 1,
-    "target_text": "Q1",
-    "score_text": "Q1: 4/5 (Missing arrows)"
+    "target_text": "4(b)i",
+    "score_text": "4(b)i: 1/1"
   },
   {
     "page": 1,
-    "target_text": "Q2",
-    "score_text": "Q2: 5/5"
+    "target_text": "4(b)ii",
+    "score_text": "4(b)ii: 2/2"
   }
 ]
 """
 
-# 4. Helper Function: Automatic Bounding-Box Detection & Stamping
+# 4. Helper Function: Disambiguated Search + Collision Avoidance
 def burn_annotations_to_pdf(pdf_bytes, json_data):
     """
-    Locates question headings programmatically on PDF pages and places score stamps 
-    immediately below the detected text bounding box in the right margin.
+    Locates question/sub-question headings programmatically on PDF pages,
+    places score stamps in the right margin, and prevents overlaps.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
     try:
         annotations = json.loads(json_data)
+        
+        # Track used vertical slots per page to prevent overlap collisions
+        used_y_coords = {}
+        
         for item in annotations:
             page_num = item.get("page", 1) - 1  # 0-indexed page index
             if 0 <= page_num < len(doc):
                 page = doc[page_num]
-                target_text = item.get("target_text", "")
-                score_text = item.get("score_text", "")
+                target_text = str(item.get("target_text", "")).strip()
+                score_text = str(item.get("score_text", "")).strip()
                 
                 page_width = page.rect.width
                 page_height = page.rect.height
                 
-                # Default right margin position
+                # Dynamic right margin placement
                 x = max(page_width - 170.0, 50.0)
-                y = 100.0  # Fallback vertical position
+                found_y = None
                 
-                # Programmatically search for the exact location of the question header on the page
+                # Multi-stage Search Strategy for Sub-questions
                 if target_text:
-                    text_instances = page.search_for(target_text)
-                    if text_instances:
-                        # Pick the first match on the page and place stamp directly below its bottom edge (+ 4px gap)
-                        first_match = text_instances[0]
-                        y = first_match.y1 + 4.0
+                    # 1. Exact Search
+                    matches = page.search_for(target_text)
+                    
+                    # 2. Sub-part fallback: search for "(ii)" if "4(b)ii" wasn't found as a single block
+                    if not matches and "(" in target_text and ")" in target_text:
+                        sub_part = target_text[target_text.find("("):]
+                        matches = page.search_for(sub_part)
+                        
+                    if matches:
+                        # Grab top-most match for this sub-question header
+                        found_y = matches[0].y1 + 2.0
+
+                # Fallback location if PyMuPDF couldn't locate target_text
+                if found_y is None:
+                    found_y = 100.0
                 
-                # Clamp Y so it stays visible on the page
-                y = min(max(y, 25.0), page_height - 25.0)
+                # ANTI-COLLISION CHECK: If another stamp is already within 18px of this location, shift downward
+                if page_num not in used_y_coords:
+                    used_y_coords[page_num] = []
                 
-                # Draw red score text directly below the target text
+                for existing_y in used_y_coords[page_num]:
+                    if abs(existing_y - found_y) < 18.0:
+                        found_y = existing_y + 18.0  # Push down by line-height step
+                
+                used_y_coords[page_num].append(found_y)
+                
+                # Clamp Y inside printable limits
+                y = min(max(found_y, 25.0), page_height - 25.0)
+                
+                # Render red score text
                 try:
                     page.insert_text(
                         fitz.Point(x, y),
                         score_text,
-                        fontsize=12,
+                        fontsize=11,
                         color=(0.85, 0, 0),  # Red
                         fontname="helv"
                     )
                 except Exception:
-                    rect = fitz.Rect(x, y, x + 150, y + 25)
+                    rect = fitz.Rect(x, y, x + 150, y + 20)
                     annot = page.add_freetext_annot(rect, score_text, fontsize=11, text_color=(0.85, 0, 0))
                     annot.update()
+                    
     except Exception as e:
         st.warning(f"Could not parse automatic PDF overlay: {e}")
 
