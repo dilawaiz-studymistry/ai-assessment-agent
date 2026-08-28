@@ -75,14 +75,20 @@ def burn_annotations_to_pdf(pdf_bytes, json_data):
                 x = item.get("x", 50)
                 y = item.get("y", 100)
                 
-                # Draw bold red text directly on the PDF
-                page.insert_text(
-                    fitz.Point(x, y),
-                    text,
-                    fontsize=12,
-                    color=(0.8, 0, 0),  # Red color (RGB)
-                    fontname="helv-bold"
-                )
+                # Draw red text directly on the PDF using built-in font
+                try:
+                    page.insert_text(
+                        fitz.Point(x, y),
+                        text,
+                        fontsize=14,
+                        color=(0.8, 0, 0),  # Red color (RGB)
+                        fontname="helv"
+                    )
+                except Exception:
+                    # Fallback method: draw as a free text annotation box
+                    rect = fitz.Rect(x, y, x + 250, y + 30)
+                    annot = page.add_freetext_annot(rect, text, fontsize=12, text_color=(0.8, 0, 0))
+                    annot.update()
     except Exception as e:
         st.warning(f"Could not parse automatic PDF overlay: {e}")
 
@@ -102,7 +108,6 @@ if st.button("🚀 Run Assessment Marking"):
     else:
         with st.spinner("Analyzing handwritten content and building score reports..."):
             try:
-                # Initialize GenAI Client
                 client = genai.Client(api_key=api_key)
                 
                 student_bytes = student_file.read()
@@ -114,7 +119,7 @@ if st.button("🚀 Run Assessment Marking"):
                     "Grade the student script against the marking scheme according to system instructions."
                 ]
                 
-                # List of reliable models to fall back on if one is busy
+                # List of active models to try sequentially
                 models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
                 response = None
                 
@@ -130,11 +135,7 @@ if st.button("🚀 Run Assessment Marking"):
                         if response:
                             break
                     except Exception as e:
-                        if "503" in str(e) or "UNAVAILABLE" in str(e):
-                            st.warning(f"Model {model_name} is currently busy. Routing request to backup model...")
-                            continue
-                        else:
-                            raise e
+                        continue
 
                 if response:
                     st.success("Marking Complete!")
@@ -156,7 +157,7 @@ if st.button("🚀 Run Assessment Marking"):
                             mime="application/pdf"
                         )
                 else:
-                    st.error("All AI model servers are currently busy. Please try clicking the button again in 1 minute.")
+                    st.error("Both models were unavailable. Please try again in 1 minute.")
                 
             except Exception as e:
                 st.error(f"Error processing assessment: {str(e)}")
