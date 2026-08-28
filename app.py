@@ -115,7 +115,7 @@ if st.button("🚀 Run Assessment Marking"):
                 ]
                 
                 # List of reliable models to fall back on if one is busy
-                models_to_try = ["gemini-2.5-flash", "gemini-2.5-pro"]
+                models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
                 response = None
                 
                 for model_name in models_to_try:
