@@ -65,7 +65,7 @@ if st.button("🚀 Run Assessment Marking"):
                 
                 # Execute model call using Gemini Flash
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.6-flash",
                     contents=parts,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTIONS
